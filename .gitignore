@@ -1,0 +1,21 @@
+# Build outputs
+/build/
+/cmake-build-*/
+/*.elf
+/*.bin
+/*.hex
+/*.map
+/*.list
+
+# IDE and editor files
+/.vscode/
+/.idea/
+*.code-workspace
+
+# Generated metadata
+/.cache/
+compile_commands.json
+
+# OS cruft
+Thumbs.db
+Desktop.ini
