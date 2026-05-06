@@ -16,11 +16,9 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-/* Includes ------------------------------------------------------------------ */
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "adc.h"
 #include "crc.h"
-#include "dma.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -58,20 +56,19 @@ typedef enum {
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-uint16_t adc_buf[4];
+enum {
+    ANALOG_NEUTRAL_VALUE = 2048U,
+    INPUT_FRAME_SYNC = 0x5A,
+    INPUT_FRAME_TYPE = 0x01,
+    INPUT_FRAME_LEN_EXTENDED = 0x0E
+};
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile uint8_t can_send = 0; // Transmission control switch
 volatile SystemState_t current_state = STATE_WAIT_START;
-
-enum {
-    INPUT_FRAME_SYNC = 0x5A,
-    INPUT_FRAME_TYPE = 0x01,
-    INPUT_FRAME_LEN_EXTENDED = 0x0E
-};
+volatile uint8_t sample_due = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -102,25 +99,83 @@ uint8_t calculate_crc8(const uint8_t *data, uint32_t len) {
     return (uint8_t)(hcrc.Instance->DR);
 }
 
-// Flag: set by interrupt, processed in main loop
-volatile uint8_t adc_ready_flag = 0;
-
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
-    if (hadc->Instance == ADC1) {
-        adc_ready_flag = 1; // Set flag and exit interrupt as fast as possible
-    }
+static uint8_t pack_3pos_state(uint8_t value, uint8_t bit_offset)
+{
+    return (uint8_t)((value & 0x03U) << bit_offset);
 }
 
-void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+static uint8_t is_button_pressed(GPIO_TypeDef *port, uint16_t pin)
 {
-    // If entered, ADC peripheral has failed (commonly OVR error)
-    if (hadc->Instance == ADC1) {
-        // Indicate error with a specific flash pattern (fast flashing)
-        while(1) {
-            HAL_GPIO_TogglePin(LED_PIN_GPIO_Port, LED_PIN_Pin);
-            HAL_Delay(50); 
-        }
+    return HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET;
+}
+
+static uint8_t read_three_pos_switch(GPIO_TypeDef *low_port, uint16_t low_pin,
+                                     GPIO_TypeDef *high_port, uint16_t high_pin,
+                                     uint8_t previous_value)
+{
+    uint8_t low_active = is_button_pressed(low_port, low_pin);
+    uint8_t high_active = is_button_pressed(high_port, high_pin);
+
+    if (low_active && high_active) {
+        return previous_value;
     }
+    if (low_active) {
+        return 0U;
+    }
+    if (high_active) {
+        return 2U;
+    }
+    return 1U;
+}
+
+static uint16_t read_buttons_mask(void)
+{
+    uint16_t buttons = 0;
+
+    if (is_button_pressed(BTN1_UP_GPIO_Port, BTN1_UP_Pin)) {
+        buttons |= (1U << 0);
+    }
+    if (is_button_pressed(BTN1_DOWN_GPIO_Port, BTN1_DOWN_Pin)) {
+        buttons |= (1U << 1);
+    }
+    if (is_button_pressed(BTN1_LEFT_GPIO_Port, BTN1_LEFT_Pin)) {
+        buttons |= (1U << 2);
+    }
+    if (is_button_pressed(BTN1_RIGHT_GPIO_Port, BTN1_RIGHT_Pin)) {
+        buttons |= (1U << 3);
+    }
+    if (is_button_pressed(BTN1_MID_GPIO_Port, BTN1_MID_Pin)) {
+        buttons |= (1U << 4);
+    }
+
+    return buttons;
+}
+
+static void fill_button_packet(CRSF_Frame_t *packet)
+{
+    static uint8_t switch_b_state = 1U;
+    static uint8_t switch_c_state = 1U;
+
+    packet->sync = INPUT_FRAME_SYNC;
+    packet->len  = INPUT_FRAME_LEN_EXTENDED;
+    packet->type = INPUT_FRAME_TYPE;
+
+    for (uint32_t i = 0; i < 4; i++) {
+        packet->ch[i] = ANALOG_NEUTRAL_VALUE;
+    }
+
+    switch_b_state = read_three_pos_switch(SB_LO_GPIO_Port, SB_LO_Pin,
+                                           SB_HI_GPIO_Port, SB_HI_Pin,
+                                           switch_b_state);
+    switch_c_state = read_three_pos_switch(SC_HO_GPIO_Port, SC_HO_Pin,
+                                           SC_HI_GPIO_Port, SC_HI_Pin,
+                                           switch_c_state);
+
+    packet->sw = (uint8_t)(pack_3pos_state(switch_b_state, 0U) |
+                           pack_3pos_state(switch_c_state, 2U));
+    packet->sh = 0;
+    packet->buttons = read_buttons_mask();
+    packet->crc = calculate_crc8(&packet->type, packet->len - 1U);
 }
 
 static uint8_t uart_rx_byte;
@@ -129,41 +184,46 @@ static uint8_t idx_start = 0;
 static const char *cmd_sleep = "sleep_stm";
 static uint8_t idx_sleep = 0;
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+static void process_uart_byte(uint8_t rx_byte)
 {
-    if (huart->Instance == USART1) {
-        // State Machine for Command Parsing
-        if (current_state == STATE_WAIT_START) {
-            // Match "start_stm"
-            if (uart_rx_byte == cmd_start[idx_start]) {
-                idx_start++;
-                if (idx_start >= 9) {
-                    current_state = STATE_ACTIVE;
-                    idx_start = 0;
-                    // Reset Active State counters if needed, handled in main usually
-                }
-            } else if (uart_rx_byte == cmd_start[0]) {
-                idx_start = 1;
-            } else {
+    if (current_state == STATE_WAIT_START) {
+        if (rx_byte == cmd_start[idx_start]) {
+            idx_start++;
+            if (idx_start >= 9U) {
+                current_state = STATE_ACTIVE;
                 idx_start = 0;
             }
+        } else if (rx_byte == (uint8_t)cmd_start[0]) {
+            idx_start = 1;
         } else {
-            // Match "sleep_stm"
-            if (uart_rx_byte == cmd_sleep[idx_sleep]) {
-                idx_sleep++;
-                if (idx_sleep >= 9) {
-                    current_state = STATE_WAIT_START;
-                    idx_sleep = 0;
-                }
-            } else if (uart_rx_byte == cmd_sleep[0]) {
-                idx_sleep = 1;
-            } else {
+            idx_start = 0;
+        }
+    } else {
+        if (rx_byte == cmd_sleep[idx_sleep]) {
+            idx_sleep++;
+            if (idx_sleep >= 9U) {
+                current_state = STATE_WAIT_START;
                 idx_sleep = 0;
             }
+        } else if (rx_byte == (uint8_t)cmd_sleep[0]) {
+            idx_sleep = 1;
+        } else {
+            idx_sleep = 0;
         }
-        
-        // Restart single byte reception interrupt
-        HAL_UART_Receive_IT(huart, &uart_rx_byte, 1);
+    }
+}
+
+static void poll_uart_commands(void)
+{
+    while (HAL_UART_Receive(&huart2, &uart_rx_byte, 1, 0) == HAL_OK) {
+        process_uart_byte(uart_rx_byte);
+    }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1) {
+        sample_due = 1;
     }
 }
 /* USER CODE END 0 */
@@ -197,82 +257,30 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_ADC1_Init();
   MX_CRC_Init();
-  MX_USART1_UART_Init();
-  MX_TIM3_Init();
+  MX_USART2_UART_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-  // Start ADC Calibration
-  if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK)
+  if (HAL_TIM_Base_Start_IT(&htim1) != HAL_OK)
   {
     Error_Handler();
   }
-  
-  // Start ADC in DMA mode
-  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, 4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  
-  // Start Timer 3
-  if (HAL_TIM_Base_Start(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  
-  // Start UART Reception in Interrupt Mode
-  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
-
-  static int led_cnt = 0; 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    poll_uart_commands();
+
     if (current_state == STATE_WAIT_START) {
-        // Silent Fast Flash (100ms)
-        static uint32_t last_t = 0;
-        if (HAL_GetTick() - last_t > 100) {
-            HAL_GPIO_TogglePin(LED_PIN_GPIO_Port, LED_PIN_Pin);
-            last_t = HAL_GetTick();
-        }
-        // Clear ADC flag if it sets during wait so we don't process stale data
-        adc_ready_flag = 0; 
-        
+        sample_due = 0;
     } else {
-        // ACTIVE STATE
-        if (adc_ready_flag) {
-            led_cnt++;
-            // Toggle LED every 250 data updates
-            if (led_cnt >= 250) { 
-                HAL_GPIO_TogglePin(LED_PIN_GPIO_Port, LED_PIN_Pin);
-                led_cnt = 0;
-            }
-            adc_ready_flag = 0; // Clear flag
-
+        if (sample_due) {
             CRSF_Frame_t packet;
-            
-            // 1. Fill Header
-            packet.sync = INPUT_FRAME_SYNC;
-            packet.len  = INPUT_FRAME_LEN_EXTENDED;
-            packet.type = INPUT_FRAME_TYPE;
-
-            // 2. Fill Channel Data
-            for (int i = 0; i < 4; i++) {
-                packet.ch[i] = adc_buf[i]; 
-            }
-            
-            packet.sw = 0;
-            packet.sh = 0;
-            packet.buttons = 0;
-
-            // 3. Calculate CRC
-            packet.crc = calculate_crc8(&packet.type, packet.len - 1);
-
-            // 4. Transmit (Blocking mode is fine for TX as long as RX is IT)
-            HAL_UART_Transmit(&huart1, (uint8_t*)&packet, sizeof(packet), 10);
+            sample_due = 0;
+            fill_button_packet(&packet);
+            HAL_UART_Transmit(&huart2, (uint8_t*)&packet, sizeof(packet), 10);
         }
     }
     /* USER CODE END WHILE */
@@ -342,8 +350,6 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
-    HAL_Delay(200);
-    HAL_GPIO_TogglePin(LED_PIN_GPIO_Port, LED_PIN_Pin);
   }
   /* USER CODE END Error_Handler_Debug */
 }
