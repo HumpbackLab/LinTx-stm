@@ -88,11 +88,13 @@
 
 #### `buttons`
 
-- bit0 = `BTN1_UP`
-- bit1 = `BTN1_DOWN`
-- bit2 = `BTN1_LEFT`
-- bit3 = `BTN1_RIGHT`
-- bit4 = `BTN1_MID`
+当前五向键映射到协议中的第 3 组五向键：
+
+- bit10 = `BTN1_UP`
+- bit11 = `BTN1_DOWN`
+- bit12 = `BTN1_LEFT`
+- bit13 = `BTN1_RIGHT`
+- bit14 = `BTN1_MID`
 
 #### `sw`
 

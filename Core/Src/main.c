@@ -133,19 +133,19 @@ static uint16_t read_buttons_mask(void)
     uint16_t buttons = 0;
 
     if (is_button_pressed(BTN1_UP_GPIO_Port, BTN1_UP_Pin)) {
-        buttons |= (1U << 0);
+        buttons |= (1U << 10);
     }
     if (is_button_pressed(BTN1_DOWN_GPIO_Port, BTN1_DOWN_Pin)) {
-        buttons |= (1U << 1);
+        buttons |= (1U << 11);
     }
     if (is_button_pressed(BTN1_LEFT_GPIO_Port, BTN1_LEFT_Pin)) {
-        buttons |= (1U << 2);
+        buttons |= (1U << 12);
     }
     if (is_button_pressed(BTN1_RIGHT_GPIO_Port, BTN1_RIGHT_Pin)) {
-        buttons |= (1U << 3);
+        buttons |= (1U << 13);
     }
     if (is_button_pressed(BTN1_MID_GPIO_Port, BTN1_MID_Pin)) {
-        buttons |= (1U << 4);
+        buttons |= (1U << 14);
     }
 
     return buttons;
